@@ -9,7 +9,6 @@ on: # rebuild any PRs and main branch changes
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  # FIXME: Find a better name
   IS_RELEASE_BRANCH: |
     ${{
       (github.ref == 'refs/heads/main'
@@ -21,8 +20,8 @@ env:
 
 jobs:
   # Compile native bridge code and isolate extension for Windows, Mac and Linux.
-  # Uploads the packages as a build artifact to be tested later.
-  compile-binaries:
+  # Uploads the native library for each target as a build artifact.
+  compile-native-binaries:
     strategy:
       fail-fast: true
       matrix:
@@ -51,6 +50,7 @@ jobs:
         shell: bash
     steps:
       - name: 'Checkout code'
+        # Starting with v4.0.0, actions/checkout requires Node 20, which doesn't work on Ubuntu 18.04 runners
         uses: actions/checkout@v3
         with:
           submodules: recursive
@@ -85,13 +85,14 @@ jobs:
 
       - name: Rust Cargo and Build cache
         if: steps.cached-artifact.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
+        # Starting with 2.7.2, rust-cache requires Node 20, which doesn't work on Ubuntu 18.04 runners
+        uses: Swatinem/rust-cache@v2.7.1
         with:
           workspaces: packages/core-bridge -> target
           prefix-key: corebridge-buildcache
           shared-key: ${{ matrix.target }}
           env-vars: ''
-          # save-if: (github.ref == 'refs/heads/main')
+          # save-if: ${{ env.IS_RELEASE_BRANCH }}
 
       - name: Cross compile rust code
         if: steps.cached-artifact.outputs.cache-hit != 'true'
@@ -107,15 +108,18 @@ jobs:
             cp -a $i  ./releases/${{ matrix.target }}/index.node || true
           done
 
+      # Starting with v4.0.0, actions/upload-artifact requires Node 20, which doesn't work on Ubuntu 18.04 runners
       - uses: actions/upload-artifact@v3
         with:
           name: corebridge-native-${{ matrix.target }}
           # Actual file will be named ${{ matrix.target }}/index.node
           path: ./packages/core-bridge/releases/*/index.node
 
+  # Build all @temporalio/* packages
+  # Uploads the built packages as a Verdaccio repository.
   build-packages:
     needs:
-      - compile-binaries
+      - compile-native-binaries
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -140,7 +144,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v3
         with:
-          node-version: 16
+          node-version: 20
 
       - name: Get NPM cache directory
         id: npm-cache-dir
@@ -155,6 +159,7 @@ jobs:
             npm-main-ubuntu-
 
       - name: Download dependencies
+        # Make up to 3 attempts to install NPM dependencies, to work around transient NPM errors
         run: |
           npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose
 
@@ -173,24 +178,23 @@ jobs:
       - name: Save NPM cache
         uses: actions/cache/save@v3
         # Only saves NPM cache from the main branch, to reduce pressure on the cache (limited to 10GB).
-        # if: github.ref == 'refs/heads/main' # FIXME
+        if: ${{ env.IS_RELEASE_BRANCH }}
         with:
           path: ${{ steps.npm-cache-dir.outputs.dir }}
           key: npm-main-ubuntu-${{ hashFiles('./package-lock.json') }}
 
+  # Run integration tests. Uses the native binaries built in compile-native-binaries,
+  # but build `@temporalio/*` packages locally.
   integration-tests:
     needs:
-      - compile-binaries
+      - compile-native-binaries
     strategy:
       fail-fast: false
       matrix:
         node: [14, 16, 18, 20]
         os: [ubuntu, macos, windows]
         reuse-v8-context: [true, false]
-        server: [cli] # FIXME: Add 'cloud', 'testenv'
-        # exclude:
-        # FIXME: Disable 'cloud' if 'TEMPORAL_CLIENT_CERT' isn't set
-        # - server: "${{ env.TEMPORAL_CLIENT_CERT == '' && 'cloud' || 'ignore' }}"
+        server: [cli] # FIXME: Add 'cloud'
         include:
           - os: ubuntu
             runner: ubuntu-latest
@@ -206,9 +210,6 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Print build information
-        run: 'echo head_ref: ${{ github.head_ref }}, ref: ${{ github.ref }}, os: ${{ matrix.os }}, node: ${{ matrix.node }}'
-
       - name: 'Checkout code'
         uses: actions/checkout@v3
         with:
@@ -239,6 +240,7 @@ jobs:
             npm-main-${{ runner.os }}-
 
       - name: Download dependencies
+        # Make up to 3 attempts to install NPM dependencies, to work around transient NPM errors
         run: |
           npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose
 
@@ -249,12 +251,13 @@ jobs:
         if: ${{ matrix.server == 'cli' }}
         uses: temporalio/setup-temporal@v0
 
-      - name: Runs Temporal CLI
+      - name: Run Temporal CLI
         if: ${{ matrix.server == 'cli' }}
         shell: bash
         run: |
           temporal server start-dev --headless &
 
+      # FIXME: Remove this once memory check is completed -JWH
       - name: Print out Node heap statistics
         run: node -e 'console.log(v8.getHeapStatistics())'
 
@@ -364,17 +367,17 @@ jobs:
         run: node scripts/init-from-verdaccio.js --registry-dir ./tmp/registry --sample https://github.com/temporalio/samples-typescript/tree/next/${{ matrix.sample }} --target-dir ${{ runner.temp }}/example
         if: ${{ matrix.server != 'cloud' || env.TEMPORAL_CLIENT_CERT != '' }}
 
-      # FIXME: Move this to an independant github action
       - name: Install Temporal CLI
         if: ${{ matrix.server == 'cli' }}
         uses: temporalio/setup-temporal@v0
 
-      - name: Runs Temporal CLI
+      - name: Run Temporal CLI
         if: ${{ matrix.server == 'cli' }}
         shell: bash
         run: |
           temporal server start-dev --headless &
 
+      # FIXME: Remove this once memory check is completed -JWH
       - name: Print out Node heap statistics
         run: node -e 'console.log(v8.getHeapStatistics()) ; console.log(v8.getHeapStatistics())'
         working-directory: ${{ runner.temp }}/example
@@ -389,10 +392,6 @@ jobs:
       - name: Test run a workflow (non-cloud)
         run: node scripts/test-example.js --work-dir "${{ runner.temp }}/example"
         shell: bash
-        env:
-          TEMPORAL_ADDRESS: localhost
-          TEMPORAL_NAMESPACE: default
-          TEMPORAL_TASK_QUEUE: ${{ format('{0}-{1}-{2}', matrix.os, matrix.node, matrix.target) }}
         if: ${{ matrix.server == 'cli' }}
 
       - name: Test run a workflow (cloud)
@@ -400,20 +399,22 @@ jobs:
         shell: bash
         env:
           # TODO: get a permanent cloud namespace for CI
-          # These env vars are ignored by the docker server example
+          # These env vars are used by the hello-world-mtls sample
           TEMPORAL_ADDRESS: sdk-ci.a2dd6.tmprl.cloud
           TEMPORAL_NAMESPACE: sdk-ci.a2dd6
           TEMPORAL_CLIENT_CERT_PATH: ${{ runner.temp }}/certs/client.pem
           TEMPORAL_CLIENT_KEY_PATH: ${{ runner.temp }}/certs/client.key
-          TEMPORAL_TASK_QUEUE: ${{ format('{0}-{1}-{2}', matrix.os, matrix.node, matrix.target) }}
+          TEMPORAL_TASK_QUEUE: ${{ format('{0}-{1}-{2}', matrix.os, matrix.node, matrix.sample) }}
         if: ${{ matrix.server == 'cloud' && env.TEMPORAL_CLIENT_CERT != '' }}
 
       - name: Destroy certs dir
         run: rm -rf ${{ runner.temp }}/certs
         shell: bash
-        if: ${{ matrix.server == 'cloud' && env.TEMPORAL_CLIENT_CERT != '' }}
+        if: always() && ${{ matrix.server == 'cloud' && env.TEMPORAL_CLIENT_CERT != '' }}
+        continue-on-error: true
 
   # Runs the features repo tests with this repo's current SDK code
+  # FIXME: Update this job to reuse native build artifacts from compile-native-binaries
   features-tests:
     uses: temporalio/features/.github/workflows/typescript.yaml@main
     with:
@@ -422,6 +423,7 @@ jobs:
       version-is-repo-ref: true
 
   stress-tests:
+    # FIXME: Update this job to reuse native build artifacts from compile-native-binaries
     uses: ./.github/workflows/stress.yml
     with:
       test-type: ci-stress
@@ -429,6 +431,7 @@ jobs:
       reuse-v8-context: false
 
   stress-tests-reuse-context:
+    # FIXME: Update this job to reuse native build artifacts from compile-native-binaries
     uses: ./.github/workflows/stress.yml
     with:
       test-type: ci-stress
@@ -529,6 +532,7 @@ jobs:
 
       # Don't build during install phase since we're going to explicitly build
       - name: Download dependencies
+        # Make up to 3 attempts to install NPM dependencies, to work around transient NPM errors
         run: |
           npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose
 
@@ -541,7 +545,7 @@ jobs:
           ALGOLIA_API_KEY: ${{ secrets.ALGOLIA_API_KEY }}
 
       - name: Deploy prod docs # TODO: only deploy prod docs when we publish a new version
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ env.IS_RELEASE_BRANCH }}
         run: npx vercel deploy packages/docs/build -t ${{ secrets.VERCEL_TOKEN }} --name typescript --scope temporal --prod --yes
 
       - name: Deploy draft docs
